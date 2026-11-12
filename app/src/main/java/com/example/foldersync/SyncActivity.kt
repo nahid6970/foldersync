@@ -90,6 +90,7 @@ fun SyncScreen(
     var isRunning by remember { mutableStateOf(false) }
     var overallProgress by remember { mutableStateOf(0f) }
     var currentTime by remember { mutableStateOf(System.currentTimeMillis()) }
+    var lastUiUpdateMillis by remember { mutableLongStateOf(0L) }
     val progressListState = rememberLazyListState()
     
     val scope = rememberCoroutineScope()
@@ -216,14 +217,23 @@ fun SyncScreen(
                                     context = context,
                                     folders = syncFolders,
                                     onStatusUpdate = { updatedStatuses ->
-                                        syncStatuses = updatedStatuses
-                                        overallProgress = updatedStatuses.map { 
-                                            when (it.status) {
-                                                SyncState.COMPLETED -> 1f
-                                                SyncState.ERROR -> 1f
-                                                else -> it.progress
-                                            }
-                                        }.average().toFloat()
+                                        val now = System.currentTimeMillis()
+                                        val isTerminal = updatedStatuses.all {
+                                            it.status == SyncState.COMPLETED || it.status == SyncState.ERROR
+                                        }
+                                        // File operations can report progress every few milliseconds. Keep
+                                        // Compose updates to a steady cadence while always showing completion.
+                                        if (isTerminal || now - lastUiUpdateMillis >= 100L) {
+                                            lastUiUpdateMillis = now
+                                            syncStatuses = updatedStatuses
+                                            overallProgress = updatedStatuses.map {
+                                                when (it.status) {
+                                                    SyncState.COMPLETED -> 1f
+                                                    SyncState.ERROR -> 1f
+                                                    else -> it.progress
+                                                }
+                                            }.average().toFloat()
+                                        }
                                     },
                                     onComplete = {
                                         isRunning = false

@@ -12,7 +12,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.documentfile.provider.DocumentFile
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -836,17 +835,11 @@ private fun MarqueePathRow(icon: String, path: String) {
             text = path,
             modifier = Modifier
                 .weight(1f)
-                .basicMarquee(
-                    iterations = Int.MAX_VALUE,
-                    animationMode = androidx.compose.foundation.MarqueeAnimationMode.Immediately,
-                    initialDelayMillis = 400,
-                    repeatDelayMillis = 300
-                ),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
             softWrap = false,
-            overflow = TextOverflow.Clip
+            overflow = TextOverflow.Ellipsis
         )
     }
 }
