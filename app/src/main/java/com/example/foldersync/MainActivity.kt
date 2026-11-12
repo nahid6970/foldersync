@@ -1,0 +1,1631 @@
+package com.example.foldersync
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.view.WindowManager
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.enableEdgeToEdge
+import androidx.documentfile.provider.DocumentFile
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
+
+import androidx.compose.material3.*
+import androidx.compose.ui.draw.scale
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.input.KeyboardType
+import com.example.foldersync.ui.theme.FolderSyncTheme
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import java.util.*
+import java.text.SimpleDateFormat
+import java.io.File
+
+class MainActivity : ComponentActivity() {
+    
+    private var pendingFolderUri: Uri? = null
+    private var folderNeedingPermission: SyncFolder? = null
+    private var showAddFolderDialog by mutableStateOf(false)
+    private var pendingImportCallback: ((List<SyncFolder>, String) -> Unit)? = null
+    private var pendingExportData: SyncBackup? = null
+    
+    private fun updateKeepScreenOn(enabled: Boolean) {
+        if (enabled) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+    
+    private val folderPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        uri?.let { selectedUri ->
+            // Take persistent permission
+            contentResolver.takePersistableUriPermission(
+                selectedUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            
+            // Check if we're updating an existing folder's permission
+            if (folderNeedingPermission != null) {
+                // Update the URI for the existing folder
+                val currentFolders = loadSyncFolders(this)
+                val updatedFolders = currentFolders.map { folder ->
+                    if (folder.id == folderNeedingPermission!!.id) {
+                        folder.copy(androidUriString = selectedUri.toString())
+                    } else {
+                        folder
+                    }
+                }
+                saveSyncFolders(this, updatedFolders)
+                Toast.makeText(this, "Permission updated for ${folderNeedingPermission!!.name}", Toast.LENGTH_SHORT).show()
+                folderNeedingPermission = null
+            } else {
+                // Add to pending folder creation
+                pendingFolderUri = selectedUri
+                showAddFolderDialog = true
+                Toast.makeText(this, "Selected: ${selectedUri.path}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    
+    private val exportLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        uri?.let { selectedUri ->
+            pendingExportData?.let { backup ->
+                try {
+                    contentResolver.openOutputStream(selectedUri)?.use { outputStream ->
+                        outputStream.write(Gson().toJson(backup).toByteArray())
+                    }
+                    Toast.makeText(this, "Settings exported successfully!", Toast.LENGTH_LONG).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+                pendingExportData = null
+            }
+        }
+    }
+    
+    private val importLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let { selectedUri ->
+            pendingImportCallback?.let { callback ->
+                try {
+                    contentResolver.openInputStream(selectedUri)?.use { inputStream ->
+                        val json = inputStream.bufferedReader().use { it.readText() }
+                        val backup = Gson().fromJson(json, SyncBackup::class.java)
+                        callback(backup.folders, backup.serverUrl)
+                        Toast.makeText(this, "Settings imported successfully!", Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Import failed: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+                pendingImportCallback = null
+            }
+        }
+    }
+    
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            FolderSyncTheme {
+                MainScreen(
+                    onPickFolder = { folderPickerLauncher.launch(null) },
+                    pendingFolderUri = pendingFolderUri,
+                    showAddFolderDialog = showAddFolderDialog,
+                    onAddFolderDialogDismiss = { 
+                        showAddFolderDialog = false
+                        pendingFolderUri = null
+                    },
+                    onExportSettings = ::exportSyncFolders,
+                    onImportSettings = ::importSyncFolders,
+                    onUpdateKeepScreenOn = ::updateKeepScreenOn,
+                    onResetFolderPermission = { folder ->
+                        folderNeedingPermission = folder
+                        folderPickerLauncher.launch(null)
+                    }
+                )
+            }
+        }
+    }
+    
+    fun exportSyncFolders(folders: List<SyncFolder>, serverUrl: String) {
+        val backup = SyncBackup(
+            folders = folders,
+            serverUrl = serverUrl,
+            exportDate = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date()),
+            version = "1.0"
+        )
+        
+        pendingExportData = backup
+        val fileName = "FolderSync_Backup_${SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault()).format(java.util.Date())}.json"
+        exportLauncher.launch(fileName)
+    }
+    
+    fun importSyncFolders(onImport: (List<SyncFolder>, String) -> Unit) {
+        pendingImportCallback = onImport
+        importLauncher.launch(arrayOf("application/json"))
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainScreen(
+    onPickFolder: () -> Unit,
+    pendingFolderUri: Uri?,
+    showAddFolderDialog: Boolean,
+    onAddFolderDialogDismiss: () -> Unit,
+    onExportSettings: (List<SyncFolder>, String) -> Unit,
+    onImportSettings: ((List<SyncFolder>, String) -> Unit) -> Unit,
+    onUpdateKeepScreenOn: (Boolean) -> Unit,
+    onResetFolderPermission: (SyncFolder) -> Unit
+) {
+    val context = LocalContext.current
+    val sharedPrefs = context.getSharedPreferences("folder_sync_prefs", Context.MODE_PRIVATE)
+    
+    var serverUrl by remember { 
+        mutableStateOf(sharedPrefs.getString("server_url", "http://192.168.0.101:5016") ?: "http://192.168.0.101:5016") 
+    }
+    var timeoutMinutes by remember {
+        mutableStateOf(sharedPrefs.getInt("timeout_minutes", 1))
+    }
+    var keepScreenOn by remember {
+        mutableStateOf(sharedPrefs.getBoolean("keep_screen_on", false))
+    }
+    var syncFolders by remember { mutableStateOf(loadSyncFolders(context)) }
+    var showSettings by remember { mutableStateOf(false) }
+    var editingFolder by remember { mutableStateOf<SyncFolder?>(null) }
+    var advancedSettingsFolder by remember { mutableStateOf<SyncFolder?>(null) }
+    var folderToDelete by remember { mutableStateOf<SyncFolder?>(null) }
+    var showDeleteConfirmation by remember { mutableStateOf(false) }
+    var folderForIgnoreList by remember { mutableStateOf<SyncFolder?>(null) }
+    var showIgnoreList by remember { mutableStateOf(false) }
+    
+    // Keep screen on is now handled only during sync progress
+    
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Folder Sync") },
+                actions = {
+                    // Add button
+                    IconButton(onClick = onPickFolder) {
+                        Icon(Icons.Default.Add, contentDescription = "Add Folder")
+                    }
+                    
+                    // Sync button
+                    IconButton(
+                        onClick = {
+                            try {
+                                if (syncFolders.any { it.isEnabled }) {
+                                    val intent = Intent(context, SyncActivity::class.java)
+                                    context.startActivity(intent)
+                                } else {
+                                    Toast.makeText(context, "No folders enabled for sync", Toast.LENGTH_SHORT).show()
+                                }
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Error starting sync: ${e.message}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Start Sync")
+                    }
+                    
+                    // Settings button
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings")
+                    }
+                }
+            )
+        }
+    ) { paddingValues ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues)
+                .padding(16.dp)
+        ) {
+            if (syncFolders.isEmpty()) {
+                // Empty state
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = "No sync folders configured",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Tap the + button to add your first sync folder",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            } else {
+                // Sync folders list
+                Text(
+                    text = "Sync Folders (${syncFolders.count { it.isEnabled }} enabled)",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 16.dp)
+                )
+                
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    itemsIndexed(syncFolders) { index, folder ->
+                        SyncFolderCard(
+                            folder = folder,
+                            onToggleEnabled = { enabled ->
+                                syncFolders = syncFolders.map { 
+                                    if (it.id == folder.id) it.copy(isEnabled = enabled) else it 
+                                }
+                                saveSyncFolders(context, syncFolders)
+                            },
+                            onEdit = { editingFolder = folder },
+                            onDelete = {
+                                folderToDelete = folder
+                                showDeleteConfirmation = true
+                            },
+                            onAdvancedSettings = { advancedSettingsFolder = folder },
+                            onIgnoreList = {
+                                folderForIgnoreList = folder
+                                showIgnoreList = true
+                            },
+                            onMoveUp = {
+                                if (index > 0) {
+                                    val mutableList = syncFolders.toMutableList()
+                                    val temp = mutableList[index]
+                                    mutableList[index] = mutableList[index - 1]
+                                    mutableList[index - 1] = temp
+                                    syncFolders = mutableList
+                                    saveSyncFolders(context, syncFolders)
+                                }
+                            },
+                            canMoveUp = index > 0,
+                            onResetPermission = {
+                                onResetFolderPermission(folder)
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+    
+    // Settings Dialog
+    if (showSettings) {
+        SettingsDialog(
+            currentUrl = serverUrl,
+            currentTimeout = timeoutMinutes,
+            currentKeepScreenOn = keepScreenOn,
+            onUrlChange = { newUrl ->
+                serverUrl = newUrl
+                sharedPrefs.edit().putString("server_url", newUrl).apply()
+                Toast.makeText(context, "Server URL saved", Toast.LENGTH_SHORT).show()
+            },
+            onTimeoutChange = { newTimeout ->
+                timeoutMinutes = newTimeout
+                sharedPrefs.edit().putInt("timeout_minutes", newTimeout).apply()
+                Toast.makeText(context, "Timeout saved", Toast.LENGTH_SHORT).show()
+            },
+            onKeepScreenOnChange = { newKeepScreenOn ->
+                keepScreenOn = newKeepScreenOn
+                sharedPrefs.edit().putBoolean("keep_screen_on", newKeepScreenOn).apply()
+                Toast.makeText(context, "Keep screen on ${if (newKeepScreenOn) "enabled" else "disabled"}", Toast.LENGTH_SHORT).show()
+            },
+            onDismiss = { showSettings = false },
+            onExport = {
+                onExportSettings(syncFolders, serverUrl)
+            },
+            onImport = {
+                onImportSettings { importedFolders, importedServerUrl ->
+                    syncFolders = importedFolders
+                    saveSyncFolders(context, importedFolders)
+                    if (importedServerUrl.isNotEmpty()) {
+                        serverUrl = importedServerUrl
+                        sharedPrefs.edit().putString("server_url", importedServerUrl).apply()
+                    }
+                }
+            }
+        )
+    }
+    
+    // Add/Edit Folder Dialog
+    if (showAddFolderDialog || editingFolder != null) {
+        AddFolderDialog(
+            existingFolder = editingFolder,
+            pendingFolderUri = pendingFolderUri,
+            onSave = { name, androidPath, pcPath, direction ->
+                val folder = if (editingFolder != null) {
+                    editingFolder!!.copy(
+                        name = name,
+                        androidPath = androidPath,
+                        pcPath = pcPath,
+                        syncDirection = direction
+                    )
+                } else {
+                    SyncFolder(
+                        id = UUID.randomUUID().toString(),
+                        name = name,
+                        androidPath = androidPath,
+                        androidUriString = pendingFolderUri?.toString(),
+                        pcPath = pcPath,
+                        syncDirection = direction
+                    )
+                }
+                
+                syncFolders = if (editingFolder != null) {
+                    syncFolders.map { if (it.id == folder.id) folder else it }
+                } else {
+                    syncFolders + folder
+                }
+                
+                saveSyncFolders(context, syncFolders)
+                onAddFolderDialogDismiss()
+                editingFolder = null
+            },
+            onDismiss = { 
+                onAddFolderDialogDismiss()
+                editingFolder = null
+            }
+        )
+    }
+    
+    // Advanced Settings Dialog
+    if (advancedSettingsFolder != null) {
+        AdvancedSettingsDialog(
+            folder = advancedSettingsFolder!!,
+            onSave = { updatedFolder ->
+                syncFolders = syncFolders.map { 
+                    if (it.id == updatedFolder.id) updatedFolder else it 
+                }
+                saveSyncFolders(context, syncFolders)
+                advancedSettingsFolder = null
+            },
+            onDismiss = { advancedSettingsFolder = null }
+        )
+    }
+    
+    // Delete Confirmation Dialog with PIN
+    if (showDeleteConfirmation && folderToDelete != null) {
+        DeleteConfirmationDialog(
+            folder = folderToDelete!!,
+            onConfirm = {
+                syncFolders = syncFolders.filter { it.id != folderToDelete!!.id }
+                saveSyncFolders(context, syncFolders)
+                showDeleteConfirmation = false
+                folderToDelete = null
+                Toast.makeText(context, "Sync folder deleted", Toast.LENGTH_SHORT).show()
+            },
+            onDismiss = {
+                showDeleteConfirmation = false
+                folderToDelete = null
+            }
+        )
+    }
+    
+    // Ignore List Dialog
+    if (showIgnoreList && folderForIgnoreList != null) {
+        IgnoreListDialog(
+            folder = folderForIgnoreList!!,
+            currentPrefixes = folderForIgnoreList!!.ignorePrefixes,
+            currentSuffixes = folderForIgnoreList!!.ignoreSuffixes,
+            onSave = { newPrefixes, newSuffixes, newFolders, newWhitelistPrefixes, newWhitelistSuffixes, newWhitelistFolders ->
+                syncFolders = syncFolders.map { 
+                    if (it.id == folderForIgnoreList!!.id) {
+                        it.copy(
+                            ignorePrefixes = newPrefixes,
+                            ignoreSuffixes = newSuffixes,
+                            ignoreFolders = newFolders,
+                            whitelistPrefixes = newWhitelistPrefixes,
+                            whitelistSuffixes = newWhitelistSuffixes,
+                            whitelistFolders = newWhitelistFolders
+                        )
+                    } else it 
+                }
+                saveSyncFolders(context, syncFolders)
+                Toast.makeText(context, "Filter settings updated for ${folderForIgnoreList!!.name}", Toast.LENGTH_SHORT).show()
+                showIgnoreList = false
+                folderForIgnoreList = null
+            },
+            onDismiss = { 
+                showIgnoreList = false
+                folderForIgnoreList = null
+            }
+        )
+    }
+}
+
+@Composable
+fun SyncFolderCard(
+    folder: SyncFolder,
+    onToggleEnabled: (Boolean) -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+    onAdvancedSettings: () -> Unit,
+    onIgnoreList: () -> Unit,
+    onMoveUp: () -> Unit,
+    canMoveUp: Boolean,
+    onResetPermission: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp)
+        ) {
+            // New improved layout
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Folder Name with up arrow
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = folder.name,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    
+                    if (canMoveUp) {
+                        IconButton(
+                            onClick = onMoveUp,
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.KeyboardArrowUp,
+                                contentDescription = "Move Up",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
+                }
+                
+                MarqueePathRow("📱", folder.androidPath)
+                MarqueePathRow("💻", folder.pcPath)
+                
+                // Compact: Source → Type → Target
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = when(folder.syncDirection) {
+                            SyncDirection.ANDROID_TO_PC -> "📱"
+                            SyncDirection.PC_TO_ANDROID -> "💻"
+                        },
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    
+                    Text(
+                        text = " → ",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
+                    
+                    Text(
+                        text = when(folder.syncDirection) {
+                            SyncDirection.ANDROID_TO_PC -> when(folder.androidToPcMode) {
+                                SyncMode.COPY_AND_DELETE -> "Copy & Delete"
+                                SyncMode.MIRROR -> "Mirror"
+                                SyncMode.SYNC -> "Sync"
+                            }
+                            SyncDirection.PC_TO_ANDROID -> when(folder.pcToAndroidMode) {
+                                SyncMode.COPY_AND_DELETE -> "Copy & Delete"
+                                SyncMode.MIRROR -> "Mirror"
+                                SyncMode.SYNC -> "Sync"
+                            }
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.secondary,
+                        fontWeight = FontWeight.Medium
+                    )
+                    
+                    Text(
+                        text = " → ",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
+                    
+                    Text(
+                        text = when(folder.syncDirection) {
+                            SyncDirection.ANDROID_TO_PC -> "💻"
+                            SyncDirection.PC_TO_ANDROID -> "📱"
+                        },
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+                
+                // Bottom row: Enable/Disable + Action buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Enable/Disable status
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Switch(
+                            checked = folder.isEnabled,
+                            onCheckedChange = onToggleEnabled,
+                            modifier = Modifier.scale(0.8f)
+                        )
+                    }
+                    
+                    // Action buttons
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // Reset Permission button
+                        IconButton(
+                            onClick = onResetPermission
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Reset Permission",
+                                tint = MaterialTheme.colorScheme.tertiary
+                            )
+                        }
+                        
+                        // Settings button
+                        IconButton(
+                            onClick = onAdvancedSettings
+                        ) {
+                            Icon(
+                                Icons.Default.Settings,
+                                contentDescription = "Settings",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        
+                        // Edit button
+                        IconButton(
+                            onClick = onEdit
+                        ) {
+                            Icon(
+                                Icons.Default.Edit,
+                                contentDescription = "Edit",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        
+                        // Ignore List button
+                        IconButton(
+                            onClick = onIgnoreList
+                        ) {
+                            Icon(
+                                Icons.Default.Clear,
+                                contentDescription = "Ignore List",
+                                tint = MaterialTheme.colorScheme.secondary
+                            )
+                        }
+                        
+                        // Delete button
+                        IconButton(
+                            onClick = onDelete
+                        ) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "Delete",
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SettingsDialog(
+    currentUrl: String,
+    currentTimeout: Int,
+    currentKeepScreenOn: Boolean,
+    onUrlChange: (String) -> Unit,
+    onTimeoutChange: (Int) -> Unit,
+    onKeepScreenOnChange: (Boolean) -> Unit,
+    onDismiss: () -> Unit,
+    onExport: () -> Unit,
+    onImport: () -> Unit
+) {
+    var tempUrl by remember { mutableStateOf(currentUrl) }
+    var tempTimeout by remember { mutableStateOf(currentTimeout.toString()) }
+    var tempKeepScreenOn by remember { mutableStateOf(currentKeepScreenOn) }
+    
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Settings") },
+        text = {
+            Column {
+                Text("Server Configuration:")
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = tempUrl,
+                    onValueChange = { tempUrl = it },
+                    label = { Text("Server URL") },
+                    placeholder = { Text("http://192.168.0.101:5016") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Example: http://192.168.0.101:5016",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // Timeout Configuration
+                Text("Network Timeout:")
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = tempTimeout,
+                    onValueChange = { tempTimeout = it },
+                    label = { Text("Timeout (minutes)") },
+                    placeholder = { Text("1") },
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Network timeout in minutes. Default: 1 minute. Increase for large files.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // Keep Screen On Configuration
+                Text("Display Settings:")
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Keep Only When Active Progress",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                    Switch(
+                        checked = tempKeepScreenOn,
+                        onCheckedChange = { tempKeepScreenOn = it }
+                    )
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                // Import/Export Section
+                Text(
+                    text = "Backup & Restore:",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Export button
+                    OutlinedButton(
+                        onClick = onExport,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            Icons.Default.Share,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Export")
+                    }
+                    
+                    // Import button
+                    OutlinedButton(
+                        onClick = onImport,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            Icons.Default.Add,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Import")
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Export your sync folders and settings to a file, or import from a backup.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                Text(
+                    text = "Note: Sync modes and duplicate handling are now configured per folder.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (tempUrl.isNotBlank()) {
+                        val timeoutValue = tempTimeout.toIntOrNull() ?: 1
+                        onUrlChange(tempUrl)
+                        onTimeoutChange(timeoutValue)
+                        onKeepScreenOnChange(tempKeepScreenOn)
+                        onDismiss()
+                    }
+                }
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+private fun MarqueePathRow(icon: String, path: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = icon,
+            modifier = Modifier.padding(end = 8.dp),
+            style = MaterialTheme.typography.bodyMedium
+        )
+        Text(
+            text = path,
+            modifier = Modifier
+                .weight(1f)
+                .basicMarquee(
+                    iterations = Int.MAX_VALUE,
+                    animationMode = androidx.compose.foundation.MarqueeAnimationMode.Immediately,
+                    initialDelayMillis = 400,
+                    repeatDelayMillis = 300
+                ),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Clip
+        )
+    }
+}
+
+@Composable
+fun AddFolderDialog(
+    existingFolder: SyncFolder?,
+    pendingFolderUri: Uri?,
+    onSave: (String, String, String, SyncDirection) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+    // Auto-populate fields when a folder is selected
+    val initialAndroidPath = existingFolder?.androidPath ?: pendingFolderUri?.let { uri ->
+        // Extract a readable path from the URI
+        uri.path?.substringAfterLast("/") ?: uri.toString()
+    } ?: ""
+    
+    val initialName = existingFolder?.name ?: pendingFolderUri?.let { uri ->
+        // Use the folder name as the default sync folder name
+        uri.path?.substringAfterLast("/") ?: "New Folder"
+    } ?: ""
+    
+    var name by remember { mutableStateOf(initialName) }
+    var androidPath by remember { mutableStateOf(initialAndroidPath) }
+    var pcPath by remember { mutableStateOf(existingFolder?.pcPath ?: "") }
+    var direction by remember { mutableStateOf(existingFolder?.syncDirection ?: SyncDirection.ANDROID_TO_PC) }
+    
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (existingFolder != null) "Edit Sync Folder" else "Add Sync Folder") },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Folder Name") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                
+                // Android Path with Reset Permission button
+                Text("Android Path:", fontWeight = FontWeight.Bold)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = androidPath,
+                        onValueChange = { androidPath = it },
+                        placeholder = { Text("/storage/emulated/0/DCIM/Camera") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(
+                        onClick = {
+                            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+                            context.startActivity(intent)
+                        },
+                        modifier = Modifier.height(56.dp)
+                    ) {
+                        Text("📁")
+                    }
+                }
+                
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = pcPath,
+                        onValueChange = { pcPath = it },
+                        label = { Text("PC Path") },
+                        placeholder = { Text("Movies or C:/Movies") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(
+                        onClick = {
+                            val sharedPrefs = context.getSharedPreferences("folder_sync_prefs", Context.MODE_PRIVATE)
+                            val dialogUrl = sharedPrefs.getString("server_url", "http://192.168.0.101:5016") ?: "http://192.168.0.101:5016"
+                            val currentBrowsePath = if (pcPath.isNotBlank()) pcPath else ""
+                            
+                            fun fetchPath(path: String) {
+                                val client = okhttp3.OkHttpClient()
+                                val encodedPath = java.net.URLEncoder.encode(path, "UTF-8")
+                                val req = okhttp3.Request.Builder()
+                                    .url("$dialogUrl/api/browse-pc?path=$encodedPath")
+                                    .build()
+                                client.newCall(req).enqueue(object : okhttp3.Callback {
+                                    override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                                        (context as? android.app.Activity)?.runOnUiThread {
+                                            Toast.makeText(context, "Could not connect to PC server", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                    override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                                        val bodyStr = response.body?.string() ?: ""
+                                        if (response.isSuccessful) {
+                                            try {
+                                                val json = org.json.JSONObject(bodyStr)
+                                                val itemsArr = json.getJSONArray("items")
+                                                val itemsList = mutableListOf<String>()
+                                                val pathsList = mutableListOf<String>()
+                                                for (i in 0 until itemsArr.length()) {
+                                                    val obj = itemsArr.getJSONObject(i)
+                                                    itemsList.add("📁 " + obj.getString("name"))
+                                                    pathsList.add(obj.getString("path"))
+                                                }
+                                                val curPath = json.optString("current_path", "")
+                                                val parentPath = json.optString("parent_path", "")
+                                                
+                                                val displayList = mutableListOf<String>()
+                                                val actionPaths = mutableListOf<String>()
+                                                
+                                                if (curPath.isNotBlank()) {
+                                                    displayList.add("✔ [Select Current Folder]")
+                                                    actionPaths.add("SELECT_CURRENT:$curPath")
+                                                    displayList.add("⬆ .. (Up)")
+                                                    actionPaths.add("GOTO:$parentPath")
+                                                }
+                                                
+                                                for (i in itemsList.indices) {
+                                                    displayList.add(itemsList[i])
+                                                    actionPaths.add("GOTO:" + pathsList[i])
+                                                }
+                                                
+                                                (context as? android.app.Activity)?.runOnUiThread {
+                                                    val builder = android.app.AlertDialog.Builder(context)
+                                                    builder.setTitle(if (curPath.isBlank()) "Select PC Drive/Folder" else curPath)
+                                                    builder.setItems(displayList.toTypedArray()) { d, which ->
+                                                        val target = actionPaths[which]
+                                                        if (target.startsWith("SELECT_CURRENT:")) {
+                                                            pcPath = target.removePrefix("SELECT_CURRENT:")
+                                                        } else if (target.startsWith("GOTO:")) {
+                                                            fetchPath(target.removePrefix("GOTO:"))
+                                                        }
+                                                    }
+                                                    builder.setNegativeButton("Cancel", null)
+                                                    builder.show()
+                                                }
+                                            } catch (e: Exception) {
+                                                (context as? android.app.Activity)?.runOnUiThread {
+                                                    Toast.makeText(context, "Error parsing server folder list", Toast.LENGTH_SHORT).show()
+                                                }
+                                            }
+                                        }
+                                    }
+                                })
+                            }
+                            fetchPath(currentBrowsePath)
+                        },
+                        modifier = Modifier.height(56.dp)
+                    ) {
+                        Text("💻")
+                    }
+                }
+                Text(
+                    text = "Use relative path (Movies), absolute path (C:/Movies), or click 💻 to browse PC",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                Text("Sync Direction:", fontWeight = FontWeight.Bold)
+                SyncDirection.values().forEach { dir ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = direction == dir,
+                            onClick = { direction = dir }
+                        )
+                        Text(when(dir) {
+                            SyncDirection.ANDROID_TO_PC -> "Android to PC"
+                            SyncDirection.PC_TO_ANDROID -> "PC to Android"
+                        })
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "💡 Use the settings icon after creating the folder to configure sync modes (Copy & Delete, Mirror, Sync)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (name.isNotBlank() && androidPath.isNotBlank() && pcPath.isNotBlank()) {
+                        onSave(name, androidPath, pcPath, direction)
+                    }
+                }
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+fun loadSyncFolders(context: Context): List<SyncFolder> {
+    val sharedPrefs = context.getSharedPreferences("folder_sync_prefs", Context.MODE_PRIVATE)
+    val json = sharedPrefs.getString("sync_folders", "[]") ?: "[]"
+    
+    return try {
+        // Try to load with new format first
+        val type = object : TypeToken<List<SyncFolder>>() {}.type
+        val folders = Gson().fromJson<List<SyncFolder>>(json, type) ?: emptyList()
+        
+        // Always try to migrate to ensure all fields are present
+        try {
+            val migratedFolders = folders.map { folder ->
+                try {
+                    // Try to access all fields and provide empty defaults if missing
+                    folder.copy(
+                        comparisonMethod = folder.comparisonMethod ?: ComparisonMethod.FAST,
+                        ignorePrefixes = folder.ignorePrefixes,
+                        ignoreSuffixes = folder.ignoreSuffixes,
+                        ignoreFolders = try { 
+                            folder.ignoreFolders 
+                        } catch (e: Exception) { 
+                            "" 
+                        }
+                    )
+                } catch (e: Exception) {
+                    // If copy fails, create a new folder with all fields
+                    SyncFolder(
+                        id = folder.id,
+                        name = folder.name,
+                        androidPath = folder.androidPath,
+                        androidUriString = folder.androidUriString,
+                        pcPath = folder.pcPath,
+                        isEnabled = folder.isEnabled,
+                        lastSyncTime = folder.lastSyncTime,
+                        syncDirection = folder.syncDirection,
+                        androidToPcMode = folder.androidToPcMode,
+                        pcToAndroidMode = folder.pcToAndroidMode,
+                        ignorePrefixes = try { folder.ignorePrefixes } catch (e: Exception) { "" },
+                        ignoreSuffixes = try { folder.ignoreSuffixes } catch (e: Exception) { "" },
+                        ignoreFolders = ""
+                    )
+                }
+            }
+            // Save migrated data
+            saveSyncFolders(context, migratedFolders)
+            android.util.Log.i("FolderSync", "Successfully migrated ${migratedFolders.size} folders with ignore folders support")
+            migratedFolders
+        } catch (migrationException: Exception) {
+            android.util.Log.e("FolderSync", "Migration failed: ${migrationException.message}")
+            throw migrationException
+        }
+    } catch (e: Exception) {
+        android.util.Log.w("FolderSync", "Failed to load sync folders, will try legacy format: ${e.message}")
+        
+        try {
+            // Try to load old format without ignore fields
+            val legacyType = object : TypeToken<List<LegacySyncFolder>>() {}.type
+            val legacyFolders = Gson().fromJson<List<LegacySyncFolder>>(json, legacyType) ?: emptyList()
+            
+            // Convert legacy folders to new format with default ignore settings
+            val migratedFolders = legacyFolders.map { legacy ->
+                SyncFolder(
+                    id = legacy.id,
+                    name = legacy.name,
+                    androidPath = legacy.androidPath,
+                    androidUriString = legacy.androidUriString,
+                    pcPath = legacy.pcPath,
+                    isEnabled = legacy.isEnabled,
+                    lastSyncTime = legacy.lastSyncTime,
+                    syncDirection = legacy.syncDirection,
+                    androidToPcMode = legacy.androidToPcMode,
+                    pcToAndroidMode = legacy.pcToAndroidMode,
+                    ignorePrefixes = "",
+                    ignoreSuffixes = "",
+                    ignoreFolders = ""
+                )
+            }
+            
+            // Save migrated data
+            saveSyncFolders(context, migratedFolders)
+            android.util.Log.i("FolderSync", "Successfully migrated ${migratedFolders.size} folders to new format")
+            migratedFolders
+        } catch (legacyException: Exception) {
+            android.util.Log.e("FolderSync", "Failed to migrate legacy data: ${legacyException.message}")
+            // If all else fails, clear the data and start fresh
+            sharedPrefs.edit().remove("sync_folders").apply()
+            emptyList()
+        }
+    }
+}
+
+// Legacy data class for migration
+data class LegacySyncFolder(
+    val id: String,
+    val name: String,
+    val androidPath: String,
+    val androidUriString: String?,
+    val pcPath: String,
+    val isEnabled: Boolean = true,
+    val lastSyncTime: Long = 0L,
+    val syncDirection: SyncDirection = SyncDirection.ANDROID_TO_PC,
+    val androidToPcMode: SyncMode = SyncMode.COPY_AND_DELETE,
+    val pcToAndroidMode: SyncMode = SyncMode.COPY_AND_DELETE
+)
+
+fun saveSyncFolders(context: Context, folders: List<SyncFolder>) {
+    val sharedPrefs = context.getSharedPreferences("folder_sync_prefs", Context.MODE_PRIVATE)
+    val json = Gson().toJson(folders)
+    sharedPrefs.edit().putString("sync_folders", json).apply()
+}
+
+fun getTimeoutSeconds(context: Context): Long {
+    val sharedPrefs = context.getSharedPreferences("folder_sync_prefs", Context.MODE_PRIVATE)
+    val minutes = sharedPrefs.getInt("timeout_minutes", 1)
+    return minutes * 60L // Convert to seconds
+}
+
+data class SyncBackup(
+    val folders: List<SyncFolder>,
+    val serverUrl: String,
+    val exportDate: String,
+    val version: String = "1.0"
+)
+
+
+
+@Composable
+fun AdvancedSettingsDialog(
+    folder: SyncFolder,
+    onSave: (SyncFolder) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var androidToPcMode by remember { mutableStateOf(folder.androidToPcMode) }
+    var pcToAndroidMode by remember { mutableStateOf(folder.pcToAndroidMode) }
+    var comparisonMethod by remember { mutableStateOf(folder.comparisonMethod) }
+    
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Advanced Sync Settings") },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = "Folder: ${folder.name}",
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                
+                Text(
+                    text = "Direction: ${when(folder.syncDirection) {
+                        SyncDirection.ANDROID_TO_PC -> "Android to PC"
+                        SyncDirection.PC_TO_ANDROID -> "PC to Android"
+                    }}",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                
+                // Show sync mode options based on folder's sync direction
+                when (folder.syncDirection) {
+                    SyncDirection.ANDROID_TO_PC -> {
+                        Text("📱→💻 Android to PC Mode:", fontWeight = FontWeight.Bold)
+                        SyncMode.values().forEach { mode ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                RadioButton(
+                                    selected = androidToPcMode == mode,
+                                    onClick = { androidToPcMode = mode }
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = mode.name.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() },
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        text = when (mode) {
+                                            SyncMode.COPY_AND_DELETE -> "Move files after successful sync"
+                                            SyncMode.MIRROR -> "Compare files, skip duplicates"
+                                            SyncMode.SYNC -> "Handle duplicate names intelligently"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    SyncDirection.PC_TO_ANDROID -> {
+                        Text("💻→📱 PC to Android Mode:", fontWeight = FontWeight.Bold)
+                        SyncMode.values().forEach { mode ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                RadioButton(
+                                    selected = pcToAndroidMode == mode,
+                                    onClick = { pcToAndroidMode = mode }
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = mode.name.replace("_", " ").lowercase().replaceFirstChar { it.uppercase() },
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        text = when (mode) {
+                                            SyncMode.COPY_AND_DELETE -> "Move files after successful sync"
+                                            SyncMode.MIRROR -> "Compare files, skip duplicates"
+                                            SyncMode.SYNC -> "Handle duplicate names intelligently"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("File comparison method:", fontWeight = FontWeight.Bold)
+                ComparisonMethod.values().forEach { method ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        RadioButton(
+                            selected = comparisonMethod == method,
+                            onClick = { comparisonMethod = method }
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = when (method) {
+                                    ComparisonMethod.FAST -> "Fast (size and date)"
+                                    ComparisonMethod.FULL_HASH -> "Full content comparison (old method)"
+                                },
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = when (method) {
+                                    ComparisonMethod.FAST -> "Quick scan; uses file size and modification time"
+                                    ComparisonMethod.FULL_HASH -> "Hashes every file before syncing; slower but verifies identical contents"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val updatedFolder = folder.copy(
+                        androidToPcMode = androidToPcMode,
+                        pcToAndroidMode = pcToAndroidMode,
+                        comparisonMethod = comparisonMethod
+                    )
+                    onSave(updatedFolder)
+                }
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+@Composable
+
+fun DeleteConfirmationDialog(
+    folder: SyncFolder,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var pinInput by remember { mutableStateOf("") }
+    val correctPin = "1823"
+    
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { 
+            Text(
+                text = "⚠️ Delete Sync Folder",
+                color = MaterialTheme.colorScheme.error
+            ) 
+        },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = "You are about to delete:",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp)
+                    ) {
+                        Text(
+                            text = folder.name,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        Text(
+                            text = "📱 ${folder.androidPath}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        Text(
+                            text = "💻 ${folder.pcPath}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                    }
+                }
+                
+                Text(
+                    text = "This action cannot be undone!",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.error
+                )
+                
+                Text(
+                    text = "To confirm deletion, enter PIN:",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                
+                OutlinedTextField(
+                    value = pinInput,
+                    onValueChange = { 
+                        if (it.length <= 4 && it.all { char -> char.isDigit() }) {
+                            pinInput = it
+                        }
+                    },
+                    label = { Text("Enter PIN: 1823") },
+                    placeholder = { Text("1823") },
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    isError = pinInput.isNotEmpty() && pinInput != correctPin,
+                    supportingText = {
+                        if (pinInput.isNotEmpty() && pinInput != correctPin) {
+                            Text(
+                                text = "Incorrect PIN",
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (pinInput == correctPin) {
+                        onConfirm()
+                    }
+                },
+                enabled = pinInput == correctPin,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error
+                )
+            ) {
+                Text("Delete Forever")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+fun IgnoreListDialog(
+    folder: SyncFolder,
+    currentPrefixes: String,
+    currentSuffixes: String,
+    onSave: (String, String, String, String, String, String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var tempPrefixes by remember { mutableStateOf(currentPrefixes) }
+    var tempSuffixes by remember { mutableStateOf(currentSuffixes) }
+    var tempFolders by remember { mutableStateOf(folder.ignoreFolders) }
+    var tempWhitelistPrefixes by remember { mutableStateOf(folder.whitelistPrefixes) }
+    var tempWhitelistSuffixes by remember { mutableStateOf(folder.whitelistSuffixes) }
+    var tempWhitelistFolders by remember { mutableStateOf(folder.whitelistFolders) }
+    
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { 
+            Text(
+                text = "🎯 Filter Settings: ${folder.name}",
+                color = MaterialTheme.colorScheme.primary
+            ) 
+        },
+        text = {
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                item {
+                    Text(
+                        text = "Configure which files to sync:",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+                
+                // Whitelist Section
+                item {
+                    Text(
+                        text = "✅ WHITELIST (Only sync these)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+                
+                item {
+                    Text(
+                        text = "Only sync files starting with:",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    OutlinedTextField(
+                        value = tempWhitelistPrefixes,
+                        onValueChange = { tempWhitelistPrefixes = it },
+                        label = { Text("Prefixes (comma-separated)") },
+                        placeholder = { Text("photo_, video_ (leave empty to allow all)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                
+                item {
+                    Text(
+                        text = "Only sync files ending with:",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    OutlinedTextField(
+                        value = tempWhitelistSuffixes,
+                        onValueChange = { tempWhitelistSuffixes = it },
+                        label = { Text("Suffixes (comma-separated)") },
+                        placeholder = { Text(".jpg, .png, .mp4 (leave empty to allow all)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                
+                item {
+                    Text(
+                        text = "Only sync folders named:",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    OutlinedTextField(
+                        value = tempWhitelistFolders,
+                        onValueChange = { tempWhitelistFolders = it },
+                        label = { Text("Folder names (comma-separated)") },
+                        placeholder = { Text("Photos, Videos (leave empty to allow all)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                
+                item {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    HorizontalDivider()
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                
+                // Ignore Section
+                item {
+                    Text(
+                        text = "🚫 IGNORE LIST (Never sync these)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+                
+                item {
+                    Text(
+                        text = "Ignore files starting with:",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    OutlinedTextField(
+                        value = tempPrefixes,
+                        onValueChange = { tempPrefixes = it },
+                        label = { Text("Prefixes (comma-separated)") },
+                        placeholder = { Text("., ~, temp (optional)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                
+                item {
+                    Text(
+                        text = "Ignore files ending with:",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    OutlinedTextField(
+                        value = tempSuffixes,
+                        onValueChange = { tempSuffixes = it },
+                        label = { Text("Suffixes (comma-separated)") },
+                        placeholder = { Text(".tmp, .pyc, .log (optional)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                
+                item {
+                    Text(
+                        text = "Ignore folders named:",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    OutlinedTextField(
+                        value = tempFolders,
+                        onValueChange = { tempFolders = it },
+                        label = { Text("Folder names (comma-separated)") },
+                        placeholder = { Text(".git, __pycache__, node_modules (optional)") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                
+                item {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Note: Whitelist is checked first. If empty, all files are allowed. Ignore list is then applied to filter out unwanted files.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onSave(
+                        tempPrefixes.trim(), 
+                        tempSuffixes.trim(), 
+                        tempFolders.trim(),
+                        tempWhitelistPrefixes.trim(),
+                        tempWhitelistSuffixes.trim(),
+                        tempWhitelistFolders.trim()
+                    )
+                }
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
