@@ -834,7 +834,7 @@ private fun MarqueePathRow(icon: String, path: String) {
         Text(
             text = path,
             modifier = Modifier
-                .weight(1f)
+                .weight(1f),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
